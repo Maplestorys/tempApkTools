@@ -1,0 +1,54 @@
+package com.maplestory;
+import java.io.FileOutputStream;
+import java.io.PrintStream;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import com.gargoylesoftware.htmlunit.BrowserVersion;
+import com.gargoylesoftware.htmlunit.WebClient;
+import com.gargoylesoftware.htmlunit.html.HtmlElement;
+import com.gargoylesoftware.htmlunit.html.HtmlPage;
+
+
+
+public class AppDownLoader {
+	public static void main(String[] args) {
+	    final WebClient webClient = new WebClient(BrowserVersion.CHROME);
+	    webClient.addRequestHeader("User-Agent", "UCWEB/2.0 (Linux; U; Adr 2.3; zh-CN; MI-ONEPlus) U2/1.0.0 UCBrowser/8.6.0.199 U2/1.0.0 Mobile");
+	    try  {
+	    	//27 便捷生活 25 金融理财 29 主题个性 28 出行导航 33 拍摄美化 345 新闻阅读 30 学习办公  26 社交通讯 24 实用工具  23 影音娱乐 358 购物比价 31 医疗健康
+	        final HtmlPage page = webClient.getPage("http://a.vmall.com/soft/31/download");
+	        System.out.println(page.asText());
+	        HtmlElement c = (HtmlElement) page.getByXPath("//*[@id='ApplicationMore']/a").get(0);
+	        int Apps = page.getByXPath("//*[@id='appListContent']").size();
+	        System.out.println(Apps);
+	        int tries = 1000; 
+	        while (tries > 0) { //you can change number of tries and condition according to your need
+	            tries--;
+	            if(page.getByXPath("//*[@id='ApplicationMore']/a").size() > 0){
+		            c = (HtmlElement) page.getByXPath("//*[@id='ApplicationMore']/a").get(0);
+		            System.out.println(c.asText());
+		            c.click();
+		            synchronized (page) {
+		                page.wait(1000); //wait
+		            }
+		            Apps = page.getByXPath("//*[@id='appListContent']/div").size();
+		            System.out.println(Apps);
+	            }
+	        }
+	        String RegExp = "javascript:window.location.href=.*class";
+	        Pattern pattern = Pattern.compile(RegExp);
+	        Matcher matcher = pattern.matcher(page.asXml().toString());
+	        FileOutputStream bos = new FileOutputStream("医疗健康.txt");
+	        System.setOut(new PrintStream(bos));
+	        while(matcher.find()){              
+	            String tmp = matcher.group();  
+	            String out = tmp.substring(tmp.indexOf('\'') + 1, tmp.lastIndexOf('\''));
+	        System.out.println(out);
+	        }
+	    }catch(Exception e){
+	    	e.printStackTrace();
+	    }
+	}
+	
+}
