@@ -3,6 +3,9 @@ Set Proxy to Shadowsocks (not necessary)
 export http_proxy=socks5://127.0.0.1:1080
 export https_proxy=socks5://127.0.0.1:1080
 
+Instructions
+- [ ] https://wiki.cyanogenmod.org/w/Build_for_angler
+
 Hosts
 https://laod.cn/hosts/2016-google-hosts.html
 GitHub.com 192.30.253.112
@@ -46,6 +49,13 @@ Change the version as follow
 
 Sync repo:
 $repo sync -c -j8
+
+Disable Gello build in device.mk:
+Cd device/huawei/angler
+Vim device.mk
+# Gello
+#PRODUCT_PACKAGES += \
+#    Gello
 
 Setup Building environments :
 Source build/envsetup.sh
