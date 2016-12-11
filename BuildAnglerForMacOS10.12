@@ -1,0 +1,56 @@
+Build angler on MacOS 
+Set Proxy to Shadowsocks (not necessary)
+export http_proxy=socks5://127.0.0.1:1080
+export https_proxy=socks5://127.0.0.1:1080
+
+Hosts
+https://laod.cn/hosts/2016-google-hosts.html
+GitHub.com 192.30.253.112
+
+Setup Environment For building On Mac
+https://source.android.com/source/initializing.html
+Sync the code on case-sensitive image
+
+Install sed ( The sed in MacOS is different from other linux )
+brew uninstall gnu-sed
+brew install gnu-sed --with-default-names
+You may refer to :
+http://stackoverflow.com/questions/30003570/how-to-use-gnu-sed-on-mac-os-x
+
+Install maven
+brew install maven
+You may refer to:
+http://stackoverflow.com/questions/22031889/how-to-install-maven-to-mac-using-terminal-without-using-brew
+
+Install MacOS.sdk 10.11 or early (not necessary if you already have the right version)
+You may refer to:
+http://palanceli.com/2016/09/25/2016/0925AOSPOnMac/
+
+Mount the case-sensitive image and start to get the source code following:
+https://wiki.cyanogenmod.org/w/Build_for_angler
+
+Install repo and add it to Path
+$ curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+$ chmod a+x ~/bin/repo
+# set PATH so it includes user's private bin if it exists
+if [ -d "$HOME/bin" ] ; then
+    PATH="$HOME/bin:$PATH"
+fi
+
+Init repo:
+$ repo init -u https://github.com/CyanogenMod/android.git -b cm-13.0
+Change the version as follow
+13.0 (Android 6.0)
+14.0 (Android 7.0)
+14.1 (Android 7.1 )
+
+Sync repo:
+$repo sync -c -j8
+
+Setup Building environments :
+Source build/envsetup.sh
+Breakfast angler (angler is the code name for Nexus 6p)
+Brunch angler (start building)
+
+
+- [ ] 
