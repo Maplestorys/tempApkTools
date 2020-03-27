@@ -15,3 +15,45 @@
 	          http://www.cis.syr.edu/~wedu/Research/paper/Malware_Analysis_2013.pdf
 	          http://newandroidbook.com/TOC.html
 	          http://davidehringer.com/software/android/The_Dalvik_Virtual_Machine.pdf
+	public static boolean findRing(ArrayList<Student> total, ArrayList<ArrayList<Student>> result) {
+		if (total.isEmpty()) {
+			return true;
+		}
+		ArrayList<Student> dispose = new ArrayList();
+		ArrayList<Student> in = new ArrayList();
+		in.add(total.get(0));
+		total.remove(0);
+		if(findNext(in, dispose, total)) {
+			result.add(in);
+			total.addAll(dispose);
+			return findRing(total, result);
+		}
+		return false;
+
+	}
+	
+	public static boolean findNext(ArrayList<Student> in, ArrayList<Student> dispose, ArrayList<Student> total) {
+		if (in.get(0).request[0] == in.get(in.size()-1).request[1]) {
+			return true;
+		}
+		
+		if (total.isEmpty()) {
+			return false;
+		}
+
+		if (in.isEmpty()) {
+			return false;
+		}
+
+		Student cur = in.get(in.size() - 1);
+		for (Student next : total) {
+			if (cur.request[1] == next.request[0]) {
+				in.add(next);
+				total.remove(next);
+				return findNext(in, dispose, total);
+			}
+		}
+		dispose.add(cur);
+		in.remove(cur);
+		return findNext(in, dispose, total);
+	}
