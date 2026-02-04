@@ -1,0 +1,606 @@
+# ability_runtime 项目架构分析
+
+## 项目概述
+
+**ability_runtime** 是 OpenHarmony 系统的元能力运行时子系统，负责 Ability 的运行及生命周期的统一调度和管理。
+
+## 一、核心架构
+
+### 目录结构
+```
+ability_runtime/
+├── frameworks/          # 核心框架实现
+│   ├── native/         # C++ 原生实现 (696个文件)
+│   ├── js/             # JavaScript 实现 (42个文件)
+│   ├── ets/            # ETS 实现 (125个文件)
+│   ├── cj/             # C++/JS 互操作
+│   └── simulator/      # 模拟器框架
+├── interfaces/         # 接口定义
+│   ├── inner_api/      # 系统内部接口
+│   └── kits/           # 对外 SDK
+├── services/           # 系统服务
+│   ├── abilitymgr/     # Ability 管理服务
+│   ├── appmgr/         # 应用管理服务
+│   └── appdfr/        # 应用冻结检测服务
+├── js_environment/     # JavaScript 运行时
+├── ets_environment/    # ETS 运行时
+└── tools/aa/          # 命令行工具
+```
+
+### 技术栈
+
+| 层级 | 技术 |
+|------|------|
+| 构建系统 | GN (Generate Ninja) |
+| 核心语言 | C++ |
+| 脚本语言 | JavaScript/TypeScript, ETS |
+| 互操作 | NAPI (Node.js API) |
+| 运行时 | JS VM, ETS Runtime |
+
+---
+
+# Watchdog 代码分析
+
+## 一、核心类结构
+
+### Watchdog 类
+**位置**: `frameworks/native/appkit/dfr/watchdog.cpp` & `interfaces/kits/native/appkit/dfr/watchdog.h`
+
+**主要成员变量**:
+```cpp
+std::atomic_bool appMainThreadIsAlive_ = false;   // 主线程存活状态
+std::atomic_bool stopWatchdog_ = false;          // 停止标志
+std::atomic_bool needReport_ = true;              // 是否允许上报
+std::atomic_bool isSixSecondEvent_ = false;       // 6秒超时事件标志
+std::atomic_bool isInBackground_ = true;          // 后台状态
+std::atomic_int backgroundReportCount_ = 0;       // 后台上报计数
+std::atomic_int watchdogReportCount_ = 0;         // watchdog上报计数
+static std::shared_ptr<EventHandler> appMainHandler_;  // 主线程处理器
+int64_t lastWatchTime_ = 0;                     // 上次检查时间
+```
+
+**检查间隔** (根据不同编译选项):
+- **ASAN 模式**: 45000ms (45秒)
+- **普通模式**: 3000ms (3秒)
+- **穿戴设备**: 5000ms (5秒)
+
+## 二、调用流程
+
+### 1. 初始化流程
+
+```
+MainThread::Start()
+    ↓
+MainThread::Init(runner)
+    ↓
+创建 Watchdog 实例
+    ↓
+watchdog_->Init(mainHandler_)
+    ↓
+Watchdog::Init()
+    ├─ 保存 mainHandler
+    ├─ 发送 CHECK_MAIN_THREAD_IS_ALIVE 事件 (VIP 优先级)
+    ├─ 注册定时任务 Timer() 到 HiviewDFX::Watchdog
+    └─ SetMainThreadSample() // 设置采样开关
+```
+
+### 2. 定时检查流程
+
+```
+HiviewDFX::Watchdog 定时触发
+    ↓
+Watchdog::Timer()  // 每3秒执行一次
+    ↓
+┌─────────────────────────────────────┐
+│ 检查是否停止                      │
+│ if (stopWatchdog_) return;        │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ 检查是否允许上报                  │
+│ if (!needReport_)                 │
+│   → 累加 watchdogReportCount_     │
+│   → 超过5次触发处理             │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ 检查主线程存活状态                │
+│ if (IsReportEvent())             │
+│   → ReportEvent()                │
+└─────────────────────────────────────┘
+    ↓
+发送 CHECK_MAIN_THREAD_IS_ALIVE 事件
+    ↓
+MainThread::MainHandler::ProcessEvent()
+    ↓
+MainThread::CheckMainThreadIsAlive()
+    ↓
+watchdog_->SetAppMainThreadState(true)
+watchdog_->AllowReportEvent()
+```
+
+### 3. 线程阻塞检测机制
+
+```
+Watchdog Timer (定时线程)                 MainThread (应用主线程)
+     │                                          │
+     ├─ Timer() 触发                            │
+     ├─ SendEvent(CHECK_MAIN_THREAD_IS_ALIVE) ────┼─> ProcessEvent()
+     ├─ 等待主线程响应                         ├─> CheckMainThreadIsAlive()
+     │                                         └─> SetAppMainThreadState(true)
+     └─ 下次 Timer() 检查                      │
+                                              │
+     ├─ IsReportEvent() 检查                    │
+     │   appMainThreadIsAlive_ == false?          │
+     │   YES → ReportEvent() (线程阻塞)          │
+     │   NO  → 正常                            │
+     └─ 重置 appMainThreadIsAlive_ = false        │
+```
+
+---
+
+# 服务侧故障处理逻辑
+
+## 一、整体架构
+
+服务侧的故障处理由以下核心组件构成：
+
+| 组件 | 文件 | 作用 |
+|------|------|------|
+| **AppMgrService** | `services/appmgr/src/app_mgr_service.cpp` | 应用管理服务，对外接口 |
+| **AppMgrServiceInner** | `services/appmgr/src/app_mgr_service_inner.cpp` | 内部实现，故障处理核心 |
+| **AppfreezeManager** | `services/appdfr/src/appfreeze_manager.cpp` | 应用冻结检测管理器 |
+| **AppfreezeEventReport** | `services/appdfr/src/appfreeze_event_report.cpp` | 系统事件上报 |
+| **AppLifeCycleDeal** | `services/appmgr/src/app_lifecycle_deal.cpp` | 应用生命周期处理 |
+| **AppRunningRecord** | `services/appmgr/src/app_running_record.cpp` | 应用运行记录 |
+
+## 二、故障上报完整流程
+
+### 1. 应用进程侧 -> 服务侧 IPC 调用
+
+```
+应用进程侧 (Watchdog 检测到阻塞)
+    ↓
+AppfreezeInner::ThreadBlock()
+    ↓
+AppfreezeInner::NotifyANR(faultData)
+    ↓
+AppMgrClient::NotifyAppFault(faultData)
+    ↓
+[IPC Binder 跨进程调用]
+    ↓
+AppMgrService::NotifyAppFault(faultData)
+    ↓
+AppMgrServiceInner::NotifyAppFault(faultData)
+```
+
+### 2. 服务侧故障转换与权限检查
+
+```
+AppMgrServiceInner::NotifyAppFault()
+    ↓
+┌─────────────────────────────────────┐
+│ 1. 权限验证                   │
+│ 检查是否是 SA 或 SystemAbility 调用 │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ 2. 数据类型转换               │
+│ AppFaultDataBySA → FaultData     │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ 3. 获取应用记录               │
+│ GetAppRunningRecordByPid(pid)  │
+└─────────────────────────────────────┘
+    ↓
+TransformedNotifyAppFault(faultData)
+```
+
+### 3. 故障过滤与延迟处理
+
+```
+TransformedNotifyAppFault()
+    ↓
+┌─────────────────────────────────────┐
+│ 跳过检测检查                   │
+│ - 是否被调试                      │
+│ - 是否已跳过                     │
+│ IsSkipDetect()                   │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ 延迟 1 秒执行超时通知         │
+│ dfxTaskHandler_->SubmitTask()    │
+│ TimeoutNotifyApp()               │
+└─────────────────────────────────────┘
+```
+
+### 4. 应用冻结堆栈收集流程
+
+```
+AppfreezeManager::AppfreezeHandleWithStack()
+    ↓
+┌─────────────────────────────────────┐
+│ 1. 收集内存信息               │
+│ CollectFreezeSysMemory()        │
+│   - /proc/pressure/memory       │
+│   - /proc/memview 或 /proc/meminfo │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ 2. 收集 Binder 信息            │
+│ GetBinderPeerPids()            │
+│   - 解析 /proc/logger/debug    │
+│   - 获取同步 Binder peer pids  │
+│   - 最多递归 8 层              │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ 3. 收集堆栈跟踪             │
+│ CatchJsonStacktrace()           │
+│   - 调用 DfxDumpCatcher      │
+│   - 超时 3 秒                 │
+│   - 最多 300KB 堆栈数据      │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ 4. 收集 CPU 频率信息         │
+│ GetCpuInfoPath()              │
+│   - 获取大核/MID 核 CPU 频率 │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ 5. 获取 HiTrace 信息         │
+│ GetHitraceInfo()              │
+│   - 链路追踪 ID               │
+│   - Span ID                  │
+└─────────────────────────────────────┘
+    ↓
+NotifyANR(faultData, appInfo, binderInfo, memoryContent)
+```
+
+---
+
+# NotifyAppFault 所有调用点分析
+
+## 一、调用点分类
+
+| 类型 | 调用来源 | 文件位置 | 故障类型 |
+|------|---------|---------|---------|
+| **主线程阻塞** | Watchdog (客户端) | `appfreeze_inner.cpp:498-519` | APP_FREEZE |
+| **输入阻塞** | Application ANR Listener | `application_anr_listener.cpp:65` | APP_FREEZE |
+| **生命周期超时** | Ability Connect Manager | `ability_connect_manager.cpp:3324` | APP_FREEZE |
+| **应用恢复** | Ability Manager Service | `ability_manager_service.cpp:9843` | APP_FREEZE / JS_ERROR |
+| **调试异常** | App Manager Service | `ability_manager_service.cpp:10200` | APP_FREEZE |
+
+## 二、详细调用路径
+
+### 1. 应用进程侧：主线程阻塞
+
+```
+应用进程
+    │
+    ├─ Watchdog::ReportEvent() 检测到阻塞
+    │
+    ├─ AppfreezeInner::ThreadBlock()
+    │   ├─ 构建 FaultData
+    │   │   faultData.errorObject.name = THREAD_BLOCK_3S / THREAD_BLOCK_6S
+    │   │   faultData.faultType = APP_FREEZE
+    │   │
+    │   └─ AppfreezeInner::NotifyANR()
+    │       └─ AppMgrClient::NotifyAppFault(faultData)
+    │           │
+    │           └─ [IPC Binder] ────────────────────────────────────────────> 服务侧
+```
+
+### 2. 服务侧：生命周期超时
+
+```
+Ability Connect Manager
+    │
+    ├─ AbilityConnectManager::PrintTimeOutLog()
+    │   │
+    │   ├─ 判断超时类型
+    │   │   │
+    │   ├─ LIFECYCLE_HALF_TIMEOUT (半超时)
+    │   │   ├─ LIFECYCLE_TIMEOUT (完整超时)
+    │   │
+    │   └─ 构建 AppFaultDataBySA:
+    │       faultData.errorObject.name = LIFECYCLE_HALF_TIMEOUT / LIFECYCLE_TIMEOUT
+    │       faultData.faultType = APP_FREEZE
+    │
+    └─ AppfreezeManager::LifecycleTimeoutHandle()
+        └─ AppMgrClient::NotifyAppFaultBySA(faultDataSA)
+            │
+            └─ [IPC Binder] ────────────────────────────────────────────> 服务侧
+```
+
+### 3. 服务侧处理流程
+
+```
+AppMgrService::NotifyAppFault(faultData)
+    │
+    ├─ 调用 AppMgrServiceInner::NotifyAppFault(faultData)
+    │   │
+    │   ├─ 权限验证 (是否 SA 调用)
+    │   │
+    │   ├─ 转换数据类型 (AppFaultDataBySA → FaultData)
+    │   │
+    │   ├─ 获取 AppRunningRecord
+    │   │
+    │   └─ 调用 AppMgrServiceInner::NotifyAppFaultBySA(faultDataSA)
+    │
+    └─ 返回结果
+```
+
+---
+
+# Freeze 故障完整调用流程
+
+## 一、完整调用流程详解
+
+### 阶段 1：故障检测与数据构造
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                      应用进程侧：故障检测与数据构造                                │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+
+① Watchdog::Timer() 检测到主线程阻塞
+    │
+    ├─ [3秒] → IsReportEvent() 返回 true (3S阻塞)
+    │   │
+    │   ├─ AppfreezeInner::ThreadBlock()
+    │   │   │
+    │   │   ├─ 构建 FaultData:
+    │   │   │   ├─ errorObject.name = "THREAD_BLOCK_3S"
+    │   │   │   ├─ faultType = APP_FREEZE
+    │   │   │   ├─ pid = getpid()
+    │   │   │   ├─ schedTime = 上次调度时间
+    │   │   │   ├─ detectTime = 当前检测时间
+    │   │   │   └─ appStatus = APP_STATUS_FOREGROUND/BACKGROUND
+    │   │   │
+    │   │   ├─ isSixSecondEvent.store(true) - 标记等待6秒检测
+    │   │   │
+    │   │   └─ AppfreezeInner::AppfreezeHandle()
+    │   │       │
+    │   │       ├─ CatchJsonStacktrace() - 收集堆栈 (3秒超时)
+    │   │       ├─ GetBinderPeerPids() - 解析 Binder peer pids
+    │   │       ├─ GetCpuInfoPath() - 获取 CPU 频率
+    │   │       └─ GetHitraceInfo() - 获取链路追踪
+    │   │
+    │   └─ 返回 (不杀进程)
+    │
+    ├─ [6秒] → IsReportEvent() 返回 true (6S阻塞)
+    │   │
+    │   ├─ AppfreezeInner::ThreadBlock()
+    │   │   │
+    │   │   ├─ 构建 FaultData:
+    │   │   │   ├─ errorObject.name = "THREAD_BLOCK_6S"
+    │   │   │   └─ procStatm = GetProcStatm(pid) - 读取内存状态
+    │   │   │
+    │   │   ├─ onlyMainThread = true
+    │   │   │
+    │   │   └─ AppfreezeInner::AppfreezeHandle()
+    │   │       │
+    │   │       ├─ 收集堆栈、Binder、CPU、Hitrace
+    │   │       │
+    │   │       └─ AppfreezeInner::NotifyANR()
+    │   │
+    │   └─ isSixSecondEvent.store(false)
+    │
+    └─ [后台6S] → BACKGROUND_WARNING (不杀进程)
+```
+
+### 阶段 2：IPC 通信到服务侧
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                      IPC Binder 跨进程调用                                        │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+
+② AppfreezeInner::NotifyANR()
+    │
+    └─ AppMgrClient::NotifyAppFault(faultData)
+        │
+        └─ [Binder IPC 跨进程调用]
+            │
+            └─> AppMgrService::NotifyAppFault(faultData)
+                │
+                └─ AppMgrServiceInner::NotifyAppFault(faultData)
+```
+
+### 阶段 3：服务侧转换与延迟处理
+
+```
+③ AppMgrServiceInner::NotifyAppFault()
+    │
+    ├─ Skip 检查
+    │
+    ├─ CheckAppFault() - 检查 dfx 任务是否在运行
+    │
+    ├─ appRecovery 特殊处理
+    │   └─ waitSaveState → AppRecoveryNotifyApp()
+    │
+    ├─ CheckAppfreezeHapped() - 60秒内重复检测
+    │
+    ├─ 获取 AppRunningUniqueId (线程阻塞)
+    │
+    └─ SubmitDfxFaultTask() - 提交异常处理任务
+```
+
+### 阶段 4：故障信息收集
+
+```
+④ NotifyAppFaultTask (dfx 线程执行)
+    │
+    └─ ParseInfoToAppfreeze(faultData, ...)
+        │
+        └─ AppfreezeManager::AppfreezeHandleWithStack()
+            │
+            ├─ AcquireStack()
+            │   ├─ CollectFreezeSysMemory() - 收集内存信息
+            │   ├─ GetBinderPeerPids() - 收集 Binder 信息
+            │   ├─ CatchJsonStacktrace() - 收集堆栈
+            │   ├─ WriteToFile() - 写入堆栈文件
+            │   ├─ GetCpuInfoPath() - 收集 CPU 频率
+            │   └─ GetHitraceInfo() - 收集 Hitrace 信息
+            │
+            └─ NotifyANR()
+                └─ SendAppfreezeEvent(eventName, FAULT, eventInfo)
+                    └─ HiSysEventWrite()
+```
+
+### 阶段 5：进程终止决策
+
+```
+⑤ 决定是否杀进程
+    │
+    ├─ TimeoutNotifyApp() - 延迟 1 秒后执行
+    │   │
+    │   ├─ 判断 isNeedExit:
+    │   │   └─ isNeedExit = (APP_INPUT_BLOCK || LIFECYCLE_TIMEOUT)
+    │   │
+    │   ├─ KillFaultApp(pid, bundleName, faultData, isNeedExit)
+    │   │   │
+    │   │   ├─ #ifdef APP_NO_RESPONSE_DIALOG
+    │   │   │   └─ 显示无响应对话框
+    │   │   │
+    │   │   └─ #else
+    │   │       └─ killAppTask lambda
+    │   │           ├─ KillProcessByPid(pid, reason)
+    │   │           │   └─ kill(pid, SIGNAL_KILL)
+    │   │           │
+    │   │           └─ 等待时间:
+    │   │               ├─ Beta 版本: 6 秒
+    │   │               └─ Release 版本: 3.5 秒
+    │
+    └─ NO → 不杀进程
+```
+
+### 阶段 6：应用恢复机制
+
+```
+⑥ 服务侧通知应用进程
+    │
+    └─ record->NotifyAppFault(transformedFaultData)
+        │
+        └─ [Binder 回调] ───────────────────────────────────────> 应用进程
+            │
+            └─ AppLifeCycleDeal::NotifyAppFault()
+                │
+                └─ AppfreezeInner::AppFreezeRecovery()
+                    │
+                    ├─ AppRecovery::ScheduleSaveAppState(APP_FREEZE)
+                    └─ AppRecovery::ScheduleRecoverApp(APP_FREEZE)
+```
+
+### 阶段 7：应用恢复启动
+
+```
+⑦ 应用被杀后重新启动
+    │
+    └─ AbilityManagerService 处理应用恢复
+        │
+        ├─ ScheduleRecoverAbility()
+        │   │
+        │   ├─ 获取 AbilityRecord
+        │   ├─ 检查前台状态
+        │   ├─ 检查 Token 权限
+        │   ├─ 检查 60 秒内恢复次数限制
+        │   └─ RestartApp(want, true)
+        │       │
+        │       └─ 重启应用
+        │           ├─ AppRecoverKill(pid, reason)
+        │           └─ Start Ability
+```
+
+## 二、关键数据结构
+
+### FaultData 结构
+
+```cpp
+struct FaultData {
+    FaultDataType faultType;              // 故障类型
+    ErrorObject errorObject;              // 错误对象
+    int32_t pid;                       // 进程 ID
+    int32_t tid;                       // 线程 ID
+    int64_t schedTime;                  // 调度时间
+    int64_t detectTime;                 // 检测时间
+    std::string timeoutMarkers;          // 超时标记
+    bool needKillProcess;               // 是否需要杀进程
+    bool forceExit;                    // 强制退出
+    bool waitSaveState;                // 等待保存状态
+    AppStatus appStatus;                // 应用状态
+    std::string appfreezeInfo;          // 冻结信息
+    std::string appRunningUniqueId;      // 唯一 ID
+    std::string procStatm;              // 内存状态
+    bool isInForeground;                // 是否前台
+    bool isEnableMainThreadSample;     // 是否启用主线程采样
+    std::string applicationHeapInfo;    // 堆信息
+    std::string processLifeTime;        // 进程生命周期
+    int32_t markedId;                  // 标记 ID
+    int32_t processedId;               // 处理 ID
+    int32_t dispatchedEventId;          // 分发事件 ID
+};
+```
+
+## 三、故障类型与处理策略
+
+| 故障类型 | 检测来源 | 超时时间 | 是否杀进程 | 收集信息 |
+|---------|----------|---------|-----------|---------|
+| **THREAD_BLOCK_3S** | Watchdog | 3秒 | 否 | 堆栈 |
+| **THREAD_BLOCK_6S** | Watchdog | 6秒 | 是 | 堆栈+Binder+内存+CPU+Hitrace |
+| **APP_INPUT_BLOCK** | Input ANR | 6秒 | 是 | 堆栈+Binder+内存+CPU+Hitrace |
+| **LIFECYCLE_HALF_TIMEOUT** | Lifecycle | 配置值 | 否 | 堆栈 |
+| **LIFECYCLE_TIMEOUT** | Lifecycle | 配置值 | 是 | 堆栈+Binder+内存+CPU |
+| **BACKGROUND_WARNING** | Watchdog(后台6s) | 6秒 | 否 | 堆栈+Binder+内存 |
+
+## 四、关键配置参数
+
+| 参数 | 默认值 | 作用 |
+|------|--------|------|
+| `WATCHDOG_CHECK_INTERVAL` | 3000ms | Watchdog 检查间隔 |
+| `DFX_DUMP_TIMEOUT` | 3000ms | 堆栈转储超时 |
+| `MAX_DUMP_SIZE` | 300KB | 最大堆栈大小 |
+| `BINDER_MAX_LAYER` | 8 | Binder 递归最大层数 |
+| `BETA_APPFREEZE_KILL_WAIT_TIME` | 6000ms | Beta 版本杀进程等待 |
+| `DEFAULT_APPFREEZE_KILL_WAIT_TIME` | 3500ms | Release 版本杀进程等待 |
+| `DELETE_STACK_DELAY` | 15000ms | 堆栈文件删除延迟 |
+| `APPFREEZE_TIMEOUT` | 30000ms | 异常处理超时 |
+| `BACKGROUND_REPORT_COUNT_MAX` | 5 | 后台容错次数 |
+
+## 五、代码位置索引
+
+| 阶段 | 文件位置 | 关键函数 |
+|------|---------|---------|
+| 故障检测 | `frameworks/native/appkit/dfr/watchdog.cpp` | `Timer()`, `IsReportEvent()` |
+| 数据构造 | `frameworks/native/appkit/dfr/appfreeze_inner.cpp` | `ThreadBlock()`, `NotifyANR()` |
+| IPC 上报 | `frameworks/native/appkit/app_client/app_mgr_client.cpp` | `NotifyAppFault()` |
+| 服务入口 | `services/appmgr/src/app_mgr_service.cpp` | `NotifyAppFault()` |
+| 服务处理 | `services/appmgr/src/app_mgr_service_inner.cpp` | `NotifyAppFault()`, `SubmitDfxFaultTask()` |
+| 信息收集 | `services/appdfr/src/appfreeze_manager.cpp` | `AcquireStack()`, `GetBinderPeerPids()` |
+| 堆栈收集 | `services/appdfr/src/appfreeze_manager.cpp` | `CatchJsonStacktrace()` |
+| Binder 解析 | `services/appdfr/src/appfreeze_manager.cpp` | `BinderParser()`, `ParseBinderPids()` |
+| 内存收集 | `services/appdfr/src/appfreeze_manager.cpp` | `CollectFreezeSysMemory()` |
+| 事件上报 | `services/appdfr/src/appfreeze_event_report.cpp` | `SendAppfreezeEvent()` |
+| 进程终止 | `services/appmgr/src/app_mgr_service_inner.cpp` | `KillFaultApp()`, `KillProcessByPid()` |
+| 应用通知 | `services/appmgr/src/app_lifecycle_deal.cpp` | `NotifyAppFault()` |
+| 应用恢复 | `frameworks/native/appkit/dfr/appfreeze_inner.cpp` | `AppFreezeRecovery()` |
+| 恢复启动 | `services/abilitymgr/src/ability_manager_service.cpp` | `ScheduleRecoverAbility()` |
+
+---
+
+# 总结
+
+ability_runtime 是一个复杂但架构清晰的系统，具有以下特点：
+
+1. **多语言支持** - 同时支持 JavaScript/TypeScript、ETS 和 C++ 开发
+2. **双模型架构** - 同时支持 FA 和 Stage 两种应用模型
+3. **分布式设计** - 原生支持分布式能力调用
+4. **高性能核心** - C++ 实现核心功能，保证性能
+5. **模块化设计** - 清晰的模块划分，易于扩展和维护
+6. **完整工具链** - 提供完整的开发和调试工具
+
+Watchdog 和 Freeze 故障处理机制具备完善的检测、收集、上报和处理流程，能够有效地检测和处理应用主线程阻塞、输入无响应、生命周期超时等故障。

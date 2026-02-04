@@ -1,0 +1,428 @@
+# 基于 epoll 的 Watchdog 消息队列改造设计
+
+## 一、当前实现分析
+
+### 当前机制
+- `std::priority_queue<WatchdogTask> checkerQueue_` - 任务优先队列
+- `std::mutex lock_` - 互斥锁
+- `std::condition_variable condition_` - 条件变量
+- `condition_.notify_all()` (watchdog_inner.cpp:1125) - 唤醒线程
+- `condition_.wait_for(lock, std::chrono::milliseconds(leftTimeMill))` (watchdog_inner.cpp:1441) - 等待
+
+### 工作流程
+```
+Start() 线程循环:
+  1. FetchNextTask() 获取下一个任务和等待时间
+  2. 有任务 -> 立即执行
+  3. 无任务/未到期 -> condition_.wait_for() 睡眠
+  4. 新任务插入 -> condition_.notify_all() 唤醒
+```
+
+---
+
+## 二、基于 epoll 的改造设计
+
+### 2.1 核心组件
+
+| 组件 | 用途 | 对应系统调用 |
+|------|------|------------|
+| **eventfd** | 唤醒 watchdog 线程 | `eventfd()` |
+| **timerfd** | 定时器管理 | `timerfd_create()`, `timerfd_settime()` |
+| **epoll** | 事件多路复用 | `epoll_create()`, `epoll_wait()` |
+
+### 2.2 文件描述符结构
+
+```cpp
+// 文件描述符类型定义
+enum EpollFdType {
+    EPOLL_FD_WAKE = 0,   // eventfd 用于唤醒
+    EPOLL_FD_TIMER = 1    // timerfd 用于定时
+};
+
+// epoll 事件上下文
+struct EpollEventContext {
+    EpollFdType type;
+    int fd;
+};
+
+// 新增成员变量到 WatchdogInner 类
+class WatchdogInner : public Singleton<WatchdogInner> {
+    // ... 现有成员 ...
+
+private:
+    int epollFd_ {-1};                    // epoll 文件描述符
+    int wakeFd_ {-1};                    // eventfd 文件描述符（用于唤醒）
+    int timerFd_ {-1};                   // timerfd 文件描述符（用于定时）
+    static const int EPOLL_MAX_EVENTS = 8; // epoll_wait 最多监听的事件数
+};
+```
+
+### 2.3 核心函数设计
+
+#### 3.1 epoll 初始化
+```cpp
+// 在 Start() 函数开始时调用
+bool WatchdogInner::InitEpoll()
+{
+    // 创建 epoll 实例
+    epollFd_ = epoll_create1(EPOLL_CLOEXEC);
+    if (epollFd_ < 0) {
+        XCOLLIE_LOGE("epoll_create1 failed, errno:%{public}d", errno);
+        return false;
+    }
+
+    // 创建 eventfd 用于唤醒
+    wakeFd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (wakeFd_ < 0) {
+        XCOLLIE_LOGE("eventfd failed, errno:%{public}d", errno);
+        close(epollFd_);
+        epollFd_ = -1;
+        return false;
+    }
+
+    // 将 eventfd 添加到 epoll
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = wakeFd_;
+    if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, wakeFd_, &ev) < 0) {
+        XCOLLIE_LOGE("epoll_ctl add wakeFd failed, errno:%{public}d", errno);
+        close(wakeFd_);
+        close(epollFd_);
+        wakeFd_ = -1;
+        epollFd_ = -1;
+        return false;
+    }
+
+    // 创建 timerfd 用于定时
+    timerFd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (timerFd_ < 0) {
+        XCOLLIE_LOGE("timerfd_create failed, errno:%{public}d", errno);
+        close(wakeFd_);
+        close(epollFd_);
+        wakeFd_ = -1;
+        epollFd_ = -1;
+        return false;
+    }
+
+    // 将 timerfd 添加到 epoll
+    ev.events = EPOLLIN;
+    ev.data.fd = timerFd_;
+    if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, timerFd_, &ev) < 0) {
+        XCOLLIE_LOGE("epoll_ctl add timerFd failed, errno:%{public}d", errno);
+        close(timerFd_);
+        close(wakeFd_);
+        close(epollFd_);
+        timerFd_ = -1;
+        wakeFd_ = -1;
+        epollFd_ = -1;
+        return false;
+    }
+
+    XCOLLIE_LOGI("epoll init success, epollFd=%{public}d, wakeFd=%{public}d, timerFd=%{public}d",
+        epollFd_, wakeFd_, timerFd_);
+    return true;
+}
+```
+
+#### 3.2 唤醒线程（替代 condition_.notify_all()）
+```cpp
+// 替代 condition_.notify_all()
+void WatchdogInner::WakeUpEpoll()
+{
+    if (wakeFd_ < 0) {
+        return;
+    }
+    const uint64_t value = 1;
+    ssize_t ret = write(wakeFd_, &value, sizeof(value));
+    if (ret < 0 && errno != EAGAIN) {
+        XCOLLIE_LOGE("write eventfd failed, errno:%{public}d", errno);
+    }
+}
+```
+
+#### 3.3 清空唤醒事件
+```cpp
+void WatchdogInner::ClearWakeEvent()
+{
+    if (wakeFd_ < 0) {
+        return;
+    }
+    uint64_t value;
+    ssize_t ret = read(wakeFd_, &value, sizeof(value));
+    if (ret < 0 && errno != EAGAIN) {
+        XCOLLIE_LOGE("read eventfd failed, errno:%{public}d", errno);
+    }
+}
+```
+
+#### 3.4 设置定时器
+```cpp
+bool WatchdogInner::SetTimerFd(uint64_t timeoutMs)
+{
+    if (timerFd_ < 0) {
+        return false;
+    }
+
+    struct itimerspec timerSpec;
+    timerSpec.it_value.tv_sec = timeoutMs / 1000;
+    timerSpec.it_value.tv_nsec = (timeoutMs % 1000) * 1000000;
+    timerSpec.it_interval.tv_sec = 0;      // 单次定时
+    timerSpec.it_interval.tv_nsec = 0;
+
+    if (timerfd_settime(timerFd_, 0, &timerSpec, nullptr) < 0) {
+        XCOLLIE_LOGE("timerfd_settime failed, errno:%{public}d", errno);
+        return false;
+    }
+
+    XCOLLIE_LOGD("timerfd set timeout: %{public}" PRIu64 " ms", timeoutMs);
+    return true;
+}
+```
+
+#### 3.5 epoll 清理
+```cpp
+void WatchdogInner::CleanupEpoll()
+{
+    if (epollFd_ >= 0) {
+        if (timerFd_ >= 0) {
+            epoll_ctl(epollFd_, EPOLL_CTL_DEL, timerFd_, nullptr);
+            close(timerFd_);
+            timerFd_ = -1;
+        }
+        if (wakeFd_ >= 0) {
+            epoll_ctl(epollFd_, EPOLL_CTL_DEL, wakeFd_, nullptr);
+            close(wakeFd_);
+            wakeFd_ = -1;
+        }
+        close(epollFd_);
+        epollFd_ = -1;
+    }
+}
+```
+
+---
+
+## 三、修改的关键点
+
+### 3.1 头文件修改 (watchdog_inner.h)
+
+```cpp
+// 在 include 部分添加
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
+
+class WatchdogInner : public Singleton<WatchdogInner> {
+    // ... 现有代码 ...
+
+private:
+    // 删除
+    // std::condition_variable condition_;
+
+    // 新增
+    int epollFd_ {-1};
+    int wakeFd_ {-1};
+    int timerFd_ {-1};
+
+    // 新增函数
+    bool InitEpoll();
+    void CleanupEpoll();
+    void WakeUpEpoll();
+    void ClearWakeEvent();
+    bool SetTimerFd(uint64_t timeoutMs);
+    int EpollWait(struct epoll_event* events, int maxEvents, int timeoutMs);
+};
+```
+
+### 3.2 源文件修改 (watchdog_inner.cpp)
+
+#### 修改点 1: Start() 函数 (line 1399-1448)
+
+```cpp
+bool WatchdogInner::Start()
+{
+    if (pthread_setname_np(pthread_self(), "OS_DfxWatchdog") != 0) {
+        XCOLLIE_LOGW("Failed to set threadName for watchdog, errno:%d.", errno);
+    }
+    SetThreadSignalMask(SIGDUMP, false, false);
+    watchdogStartTime_ = GetCurrentTickMillseconds();
+    XCOLLIE_LOGD("Watchdog is running in thread(%{public}d)!", getproctid());
+    if (SetThreadInfoCallback != nullptr) {
+        SetThreadInfoCallback(ThreadInfo);
+        XCOLLIE_LOGD("Watchdog Set Thread Info Callback");
+    }
+
+    // ========== 新增：初始化 epoll ==========
+    if (!InitEpoll()) {
+        XCOLLIE_LOGE("InitEpoll failed");
+        return false;
+    }
+
+    struct epoll_event events[EPOLL_MAX_EVENTS];
+    while (!isNeedStop_) {
+        if (__get_global_hook_flag() && __get_hook_flag()) {
+            __set_hook_flag(false);
+        }
+#if defined(__aarch64__)
+        InitAsyncStackIfNeed();
+#endif
+        uint64_t now = GetCurrentTickMillseconds();
+        WatchdogTask task;
+        uint64_t leftTimeMill;
+        {
+            std::unique_lock<std::mutex> lock(lock_);
+            leftTimeMill = FetchNextTask(now, task);
+            nextWeakUpTime_ = now + leftTimeMill;
+        }
+
+        if (leftTimeMill == 0) {
+#ifdef SUSPEND_CHECK_ENABLE
+            if (!IsInSleep(task)) {
+#endif
+                task.Run(now);
+                ReInsertTaskIfNeed(task);
+                currentScene_ = "thread DfxWatchdog: Current scenario is hicollie.\n";
+#ifdef SUSPEND_CHECK_ENABLE
+            }
+#endif
+            continue;
+        } else if (isNeedStop_) {
+            break;
+        } else {
+            // ========== 替换 condition_.wait_for() ==========
+            // 设置定时器
+            if (leftTimeMill > 0 && leftTimeMill != DEFAULT_TIMEOUT) {
+                SetTimerFd(leftTimeMill);
+            }
+
+            // epoll_wait 等待事件
+            int timeout = static_cast<int>(leftTimeMill);
+            int nfds = epoll_wait(epollFd_, events, EPOLL_MAX_EVENTS, timeout);
+
+            if (nfds < 0) {
+                if (errno == EINTR) {
+                    continue; // 被信号中断，继续循环
+                }
+                XCOLLIE_LOGE("epoll_wait failed, errno:%{public}d", errno);
+                break;
+            }
+
+            // 处理事件
+            for (int i = 0; i < nfds; i++) {
+                if (events[i].data.fd == wakeFd_) {
+                    // eventfd 唤醒事件：清空并继续
+                    ClearWakeEvent();
+                    XCOLLIE_LOGD("waked by eventfd");
+                } else if (events[i].data.fd == timerFd_) {
+                    // timerfd 超时事件：读取并继续（时间已到，会执行任务）
+                    uint64_t expirations;
+                    read(timerFd_, &expirations, sizeof(expirations));
+                    XCOLLIE_LOGD("timerfd timeout");
+                }
+            }
+        }
+    }
+
+    // ========== 新增：清理 epoll ==========
+    CleanupEpoll();
+
+    if (SetThreadInfoCallback != nullptr) {
+        SetThreadInfoCallback(nullptr);
+    }
+    return true;
+}
+```
+
+#### 修改点 2: InsertWatchdogTaskLocked() 函数 (line 1107-1129)
+
+```cpp
+int64_t WatchdogInner::InsertWatchdogTaskLocked(const std::string& name, WatchdogTask&& task)
+{
+    if (!task.isOneshotTask && IsTaskExistLocked(name)) {
+        XCOLLIE_LOGI("Task with %{public}s already exist, failed to insert.", name.c_str());
+        return 0;
+    }
+
+    if (IsExceedMaxTaskLocked()) {
+        XCOLLIE_LOGE("Exceed max watchdog task, failed to insert.");
+        return 0;
+    }
+    int64_t id = task.id;
+    checkerQueue_.push(std::move(task));
+    if (!task.isOneshotTask) {
+        taskNameSet_.insert(name);
+    }
+    CreateWatchdogThreadIfNeed();
+    if (task.nextTickTime < nextWeakUpTime_) {
+        // ========== 替换 condition_.notify_all() ==========
+        WakeUpEpoll();
+    }
+
+    return id;
+}
+```
+
+#### 修改点 3: Stop() 函数 (line 1703-1720)
+
+```cpp
+bool WatchdogInner::Stop()
+{
+    IPCDfx::SetIPCProxyLimit(0, nullptr);
+    if (mainRunner_ != nullptr) {
+        mainRunner_->SetMainLooperWatcher(nullptr, nullptr);
+    }
+    isNeedStop_.store(true);
+
+    // ========== 替换 condition_.notify_all() ==========
+    WakeUpEpoll();
+
+    if (threadLoop_ != nullptr && threadLoop_->joinable()) {
+        threadLoop_->join();
+        threadLoop_ = nullptr;
+    }
+    if (g_fd != NOT_OPEN) {
+        close(g_fd);
+        g_fd = NOT_OPEN;
+    }
+    return true;
+}
+```
+
+---
+
+## 四、改造后的工作流程
+
+```
+Start() 线程循环:
+  1. 初始化 epoll (eventfd + timerfd)
+  2. FetchNextTask() 获取下一个任务和等待时间
+  3. 有任务 -> 立即执行
+  4. 无任务/未到期 ->
+     a. SetTimerFd() 设置定时器
+     b. epoll_wait() 等待事件
+  5. 新任务插入 -> WakeUpEpoll() 唤醒
+  6. 退出 -> CleanupEpoll() 清理
+```
+
+---
+
+## 五、改造优势对比
+
+| 特性 | 当前实现 (condition_variable) | 改造后 (epoll) |
+|------|----------------------------|-----------------|
+| **唤醒机制** | mutex + condition_variable | eventfd + epoll_wait |
+| **定时机制** | 条件变量超时 | timerfd + epoll |
+| **CPU 使用** | 可能存在虚假唤醒 | 精确事件驱动 |
+| **扩展性** | 难以扩展其他 I/O 事件 | 可扩展其他 fd |
+| **线程安全** | 依赖 mutex | 需配合 mutex |
+| **系统调用** | futex (系统依赖) | epoll (Linux 标准接口) |
+
+---
+
+## 六、潜在注意事项
+
+1. **平台兼容性**: eventfd/timerfd 是 Linux 特有接口，需确保目标平台支持
+2. **错误处理**: 需处理 epoll 相关系统调用的各种错误情况
+3. **资源泄漏**: 确保 fd 在异常情况下正确关闭
+4. **性能测试**: 改造后需进行性能对比测试
+5. **回归测试**: 所有 watchdog 相关功能需要完整回归测试

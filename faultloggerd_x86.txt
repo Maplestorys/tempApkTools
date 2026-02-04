@@ -1,0 +1,391 @@
+## x86_64 下实现 FP Unwind 需要的修改分析
+
+根据代码分析，当前 ARM64 的 FP unwind 已完整实现，而 x86_64 的 FP unwind 支持缺失。以下是需要的修改：
+
+---
+
+### 1. 问题现状
+
+**当前代码中的关键限制：**
+
+在 `dfx_regs.cpp:203-217` 中，`GetFp()` 和 `SetFp()` 方法只对 ARM、ARM64、RISC-V 和 LoongArch 架构生效：
+
+```cpp
+uintptr_t DfxRegs::GetFp() const
+{
+#if defined(__arm__) || defined(__aarch64__) || defined(__loongarch_lp64)
+    return regsData_[REG_FP];
+#else
+    return 0;  // x86_64 返回 0
+#endif
+}
+
+void DfxRegs::SetFp(uintptr_t fp)
+{
+#if defined(__arm__) || defined(__aarch64__)  || defined(__riscv) || defined(__loongarch_lp64)
+    regsData_[REG_FP] = fp;
+#endif  // x86_64 不执行任何操作
+}
+```
+
+在 `fp_unwinder.h:117-128` 中，`GetPcFpRegs()` 仅实现了 ARM64 版本的汇编：
+
+```cpp
+static inline AT_ALWAYS_INLINE void GetPcFpRegs(void *regs)
+{
+#if defined(__aarch64__)
+    asm volatile(
+    "1:\n"
+    "adr x12, 1b\n"
+    "stp x12, x29, [%[base], #0]\n"
+    : [base] "+r"(regs)
+    :
+    : "x12", "memory");
+#endif
+}
+```
+
+在 `unwinder.cpp:876-905` 中，`FpStep()` 函数仅支持 ARM64：
+
+```cpp
+bool Unwinder::Impl::FpStep(uintptr_t& fp, uintptr_t& pc, void *ctx)
+{
+#if defined(__aarch64__)
+    // ARM64 FP unwind 实现完整
+    // ...
+#endif
+    return false;  // x86_64 直接返回 false
+}
+```
+
+---
+
+### 2. 需要的修改清单
+
+#### 修改 1: `dfx_regs_x86_64.cpp` - 实现 `SetFromFpMiniRegs`
+
+**文件**: `interfaces/innerkits/unwinder/src/registers/dfx_regs_x86_64.cpp:55-62`
+
+当前实现为空：
+
+```cpp
+void DfxRegsX86_64::SetFromFpMiniRegs(const uintptr_t* regs, const size_t size)
+{
+}
+```
+
+**需要实现**：
+```cpp
+void DfxRegsX86_64::SetFromFpMiniRegs(const uintptr_t* regs, const size_t size)
+{
+    if (regs == nullptr || size < FP_MINI_REGS_SIZE) {
+        return;
+    }
+    // x86_64 stack layout: [return_addr, rbp, ...]
+    regsData_[REG_X86_64_RBP] = regs[0];  // fp
+    regsData_[REG_X86_64_RSP] = regs[1];  // sp
+    regsData_[REG_X86_64_RIP] = regs[2];  // pc
+}
+```
+
+---
+
+#### 修改 2: `dfx_regs.cpp` - 在 `GetFp()` 和 `SetFp()` 中添加 x86_64 支持
+
+**文件**: `interfaces/innerkits/unwinder/src/registers/dfx_regs.cpp:203-217`
+
+**需要修改**：
+
+```cpp
+uintptr_t DfxRegs::GetFp() const
+{
+#if defined(__arm__) || defined(__aarch64__) || defined(__loongarch_lp64)
+    return regsData_[REG_FP];
+#elif defined(__x86_64__)
+    return regsData_[REG_X86_64_RBP];  // x86_64 使用 RBP 作为 FP
+#else
+    return 0;
+#endif
+}
+
+void DfxRegs::SetFp(uintptr_t fp)
+{
+#if defined(__arm__) || defined(__aarch64__) || defined(__riscv) || defined(__loongarch_lp64)
+    regsData_[REG_FP] = fp;
+#elif defined(__x86_64__)
+    regsData_[REG_X86_64_RBP] = fp;  // x86_64 使用 RBP
+#endif
+}
+```
+
+同时在 `GetSpecialRegs()` 和 `SetSpecialRegs()` 中添加支持：
+
+```cpp
+void DfxRegs::GetSpecialRegs(uintptr_t& fp, uintptr_t& lr, uintptr_t& sp, uintptr_t& pc) const
+{
+#if defined(__arm__) || defined(__aarch64__) || defined(__riscv) || defined(__loongarch_lp64)
+    fp = regsData_[REG_FP];
+    lr = regsData_[REG_LR];
+#elif defined(__x86_64__)
+    fp = regsData_[REG_X86_64_RBP];
+    lr = 0;  // x86_64 没有 LR 寄存器
+#endif
+    sp = regsData_[REG_SP];
+    pc = regsData_[REG_PC];
+}
+
+void DfxRegs::SetSpecialRegs(uintptr_t fp, uintptr_t lr, uintptr_t sp, uintptr_t pc)
+{
+#if defined(__arm__) || defined(__aarch64__) || defined(__riscv) || defined(__loongarch_lp64)
+    regsData_[REG_FP] = fp;
+    regsData_[REG_LR] = lr;
+#elif defined(__x86_64__)
+    regsData_[REG_X86_64_RBP] = fp;
+    // lr 被忽略，x86_64 不使用 LR
+#endif
+    regsData_[REG_SP] = sp;
+    regsData_[REG_PC] = pc;
+}
+```
+
+---
+
+#### 修改 3: `fp_unwinder.h` - 添加 x86_64 的 `GetPcFpRegs()` 实现
+
+**文件**: `interfaces/innerkits/unwinder/include/fp_unwinder.h:117-128`
+
+**需要添加**：
+
+```cpp
+static inline AT_ALWAYS_INLINE void GetPcFpRegs(void *regs)
+{
+#if defined(__aarch64__)
+    asm volatile(
+    "1:\n"
+    "adr x12, 1b\n"
+    "stp x12, x29, [%[base], #0]\n"
+    : [base] "+r"(regs)
+    :
+    : "x12", "memory");
+#elif defined(__x86_64__)
+    asm volatile(
+    "1:\n"
+    "lea 0(%%rip), %%rax\n"
+    "mov %%rbp, 8(%[base])\n"
+    "mov %%rax, 0(%[base])\n"
+    : [base] "+r"(regs)
+    :
+    : "rax", "memory");
+#endif
+}
+```
+
+---
+
+#### 修改 4: `unwinder.cpp` - 在 `FpStep()` 中添加 x86_64 支持
+
+**文件**: `interfaces/innerkits/unwinder/unwinder.cpp:876-905`
+
+**需要修改**：
+
+```cpp
+bool Unwinder::Impl::FpStep(uintptr_t& fp, uintptr_t& pc, void *ctx)
+{
+#if defined(__aarch64__)
+    DFXLOGU("+fp: %{public}lx, pc: %{public}lx", (uint64_t)fp, (uint64_t)pc);
+    if ((regs_ == nullptr) || (memory_ == nullptr)) {
+        DFXLOGE("[%{public}d]: params is nullptr", __LINE__);
+        return false;
+    }
+    if (ctx != nullptr) {
+        memory_->SetCtx(ctx);
+    }
+
+    uintptr_t prevFp = fp;
+    uintptr_t ptr = fp;
+    // ARM64: fp 指向 [saved_fp, saved_lr]
+    if (ptr != 0 && memory_->Read<uintptr_t>(ptr, &fp, true) &&
+        memory_->Read<uintptr_t>(ptr, &pc, false)) {
+        if (fp != 0 && fp <= prevFp) {
+            DFXLOGU("Illegal or same fp value");
+            lastErrorData_.SetAddrAndCode(pc, UNW_ERROR_ILLEGAL_VALUE);
+            return false;
+        }
+        regs_->SetReg(REG_FP, &fp);
+        regs_->SetReg(REG_SP, &prevFp);
+        regs_->SetPc(StripPac(pc, pacMask_));
+        DFXLOGU("-fp: %{public}lx, pc: %{public}lx", (uint64_t)fp, (uint64_t)pc);
+        return true;
+    }
+#elif defined(__x86_64__)
+    DFXLOGU("+fp: %{public}lx, pc: %{public}lx", (uint64_t)fp, (uint64_t)pc);
+    if ((regs_ == nullptr) || (memory_ == nullptr)) {
+        DFXLOGE("[%{public}d]: params is nullptr", __LINE__);
+        return false;
+    }
+    if (ctx != nullptr) {
+        memory_->SetCtx(ctx);
+    }
+
+    uintptr_t prevFp = fp;
+    uintptr_t ptr = fp;
+    // x86_64: fp(rbp) 指向 [saved_rbp, return_addr]
+    // stack layout: [return_addr, saved_rbp, local_vars...]
+    // rbp 指向 saved_rbp，return_addr 在 rbp+8
+    if (ptr != 0 && memory_->Read<uintptr_t>(ptr, &fp, true) &&
+        memory_->Read<uintptr_t>(ptr + 8, &pc, false)) {
+        if (fp != 0 && fp <= prevFp) {
+            DFXLOGU("Illegal or same fp value");
+            lastErrorData_.SetAddrAndCode(pc, UNW_ERROR_ILLEGAL_VALUE);
+            return false;
+        }
+        regs_->SetFp(fp);
+        regs_->SetSp(prevFp);
+        regs_->SetPc(pc);
+        DFXLOGU("-fp: %{public}lx, pc: %{public}lx", (uint64_t)fp, (uint64_t)pc);
+        return true;
+    }
+#endif
+    return false;
+}
+```
+
+---
+
+#### 修改 5: `fp_backtrace.cpp` - 添加 x86_64 编译条件
+
+**文件**: `interfaces/innerkits/backtrace/fp_backtrace.cpp:18-34`
+
+当前只支持 ARM64：
+
+```cpp
+#if is_ohos && !is_mingw && __aarch64__
+```
+
+**需要修改**为：
+
+```cpp
+#if is_ohos && !is_mingw && (__aarch64__ || __x86_64__)
+```
+
+同时需要修改 `FpBacktrace::CreateInstance()` 的条件（第 199 行）：
+
+```cpp
+FpBacktrace* FpBacktrace::CreateInstance()
+{
+#if is_ohos && !is_mingw && (__aarch64__ || __x86_64__)
+    auto fpBacktraceImpl =  new (std::nothrow) FpBacktraceImpl();
+    // ...
+#endif
+    return nullptr;
+}
+```
+
+---
+
+#### 修改 6: `thread_context.cpp` - 添加 x86_64 的上下文复制支持
+
+**文件**: `interfaces/innerkits/unwinder/src/unwind_local/thread_context.cpp:333-344`
+
+**需要在 `CopyRegister()` 中添加 x86_64 支持**：
+
+```cpp
+NO_SANITIZE void LocalThreadContextMix::CopyRegister(void *context)
+{
+    std::unique_lock<std::mutex> lock(mtx_);
+#if defined(__arm__)
+    fp_ = static_cast<ucontext_t*>(context)->uc_mcontext.arm_fp;
+    lr_ = static_cast<ucontext_t*>(context)->uc_mcontext.arm_lr;
+    sp_ = static_cast<ucontext_t*>(context)->uc_mcontext.arm_sp;
+    pc_ = static_cast<ucontext_t*>(context)->uc_mcontext.arm_pc;
+#elif defined(__aarch64__)
+    fp_ = static_cast<ucontext_t*>(context)->uc_mcontext.regs[RegsEnumArm64::REG_FP];
+    lr_ = static_cast<ucontext_t*>(context)->uc_mcontext.regs[RegsEnumArm64::REG_LR];
+    sp_ = static_cast<ucontext_t*>(context)->uc_mcontext.sp;
+    pc_ = static_cast<ucontext_t*>(context)->uc_mcontext.pc;
+#elif defined(__x86_64__)
+    fp_ = static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RBP];
+    lr_ = 0;  // x86_64 不使用 LR
+    sp_ = static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RSP];
+    pc_ = static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP];
+#endif
+}
+```
+
+同样需要在 `SetRegister()` 中添加 x86_64 支持（第 365-372 行）：
+
+```cpp
+void LocalThreadContextMix::SetRegister(std::shared_ptr<DfxRegs> regs)
+{
+#if defined(__arm__) || defined(__aarch64__)
+    std::unique_lock<std::mutex> lock(mtx_);
+    regs->SetSp(sp_);
+    regs->SetPc(pc_);
+    regs->SetFp(fp_);
+    regs->SetReg(REG_LR, &(lr_));
+#elif defined(__x86_64__)
+    std::unique_lock<std::mutex> lock(mtx_);
+    regs->SetSp(sp_);
+    regs->SetPc(pc_);
+    regs->SetFp(fp_);
+#endif
+}
+```
+
+---
+
+#### 修改 7: `fp_unwinder.h` - 在 `UnwindSafe` 中移除 ARM64 特定的 PC 调整
+
+**文件**: `interfaces/innerkits/unwinder/include/fp_unwinder.h:85-115`
+
+当前代码中有 ARM64 特定的 PC 调整：
+
+```cpp
+pc = pc > 0x4 ? pc - 0x4 : pc; // adjust pc in Arm64 architecture
+```
+
+**需要修改**为：
+
+```cpp
+#if defined(__aarch64__)
+pc = pc > 0x4 ? pc - 0x4 : pc; // adjust pc in Arm64 architecture
+#elif defined(__x86_64__)
+// x86_64 不需要 PC 调整
+#endif
+```
+
+---
+
+### 3. x86_64 FP Unwind 栈帧布局
+
+```
+x86_64 典型栈帧布局（使用 RBP 作为帧指针）:
+
++------------------+  <- 当前 RBP
+|  保存的 RBP     |  [RBP] 指向这里
++------------------+
+|  返回地址 (RA)  |  [RBP + 8]
++------------------+
+|  本地变量       |
+|  ...            |
++------------------+
+|  参数 (如适用)   |
++------------------+  <- 当前 RSP
+```
+
+FP Unwind 逻辑：
+1. 从 `RBP` 读取保存的 RBP → 新的 FP
+2. 从 `RBP + 8` 读取返回地址 → 新的 PC
+
+---
+
+### 4. 总结
+
+| 文件 | 修改内容 | 关键点 |
+|------|----------|----------|
+| `dfx_regs_x86_64.cpp` | 实现 `SetFromFpMiniRegs()` | 使用 RBP 作为 FP |
+| `dfx_regs.cpp` | 添加 x86_64 分支到 `GetFp()`, `SetFp()`, `GetSpecialRegs()`, `SetSpecialRegs()` | 返回 `REG_X86_64_RBP` |
+| `fp_unwinder.h` | 添加 `GetPcFpRegs()` 的 x86_64 汇编实现 | 读取 RIP 和 RBP |
+| `unwinder.cpp` | 在 `FpStep()` 中添加 x86_64 分支 | 读取 `[RBP]` 和 `[RBP+8]` |
+| `fp_backtrace.cpp` | 修改编译条件支持 x86_64 | `__aarch64__ \|\| __x86_64__` |
+| `thread_context.cpp` | 在 `CopyRegister()` 和 `SetRegister()` 中添加 x86_64 | 读取 RBP/RSP/RIP |
